@@ -6,30 +6,41 @@
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 
-#define COIN_PIN 2
-#define RELAY_PIN 6
-#define RESET_PIN 4        // Button to reset stock
-#define EEPROM_ADDR 0
+#define VEND_BUTTON1 3    // Button for Motor 1
+#define VEND_BUTTON2 4    // Button for Motor 2
+#define RELAY1_PIN 6      // Relay for Motor 1
+#define RELAY2_PIN 7      // Relay for Motor 2
+#define RESET_PIN 5       // Button to reset both stocks
+#define EEPROM_ADDR1 0    // EEPROM address for Motor 1 stock
+#define EEPROM_ADDR2 1    // EEPROM address for Motor 2 stock
 #define MAX_STOCK 30
 
 
-int stock = 0;
+int stock1 = 0;
+int stock2 = 0;
 
 
 void setup() {
-    pinMode(COIN_PIN, INPUT);
-    pinMode(RELAY_PIN, OUTPUT);
-    pinMode(RESET_PIN, INPUT_PULLUP);  // Reset button with pull-up
-    digitalWrite(RELAY_PIN, LOW);
+    pinMode(VEND_BUTTON1, INPUT_PULLUP);
+    pinMode(VEND_BUTTON2, INPUT_PULLUP);
+    pinMode(RELAY1_PIN, OUTPUT);
+    pinMode(RELAY2_PIN, OUTPUT);
+    pinMode(RESET_PIN, INPUT_PULLUP);
+
+
+    digitalWrite(RELAY1_PIN, LOW);
+    digitalWrite(RELAY2_PIN, LOW);
 
 
     lcd.init();
     lcd.backlight();
 
 
-    // Load saved stock
-    stock = EEPROM.read(EEPROM_ADDR);
-    if (stock > MAX_STOCK) stock = MAX_STOCK;
+    // Load saved stocks
+    stock1 = EEPROM.read(EEPROM_ADDR1);
+    stock2 = EEPROM.read(EEPROM_ADDR2);
+    if (stock1 > MAX_STOCK) stock1 = MAX_STOCK;
+    if (stock2 > MAX_STOCK) stock2 = MAX_STOCK;
 
 
     showIdleMessage();
@@ -37,10 +48,12 @@ void setup() {
 
 
 void loop() {
-    // Reset stock if button is pressed
+    // Reset both stocks
     if (digitalRead(RESET_PIN) == LOW) {
-        stock = MAX_STOCK;
-        EEPROM.write(EEPROM_ADDR, stock);
+        stock1 = MAX_STOCK;
+        stock2 = MAX_STOCK;
+        EEPROM.write(EEPROM_ADDR1, stock1);
+        EEPROM.write(EEPROM_ADDR2, stock2);
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("Stock Refilled");
@@ -49,40 +62,52 @@ void loop() {
     }
 
 
-    // Coin detection and dispensing
-    if (digitalRead(COIN_PIN) == HIGH) {
-        if (stock > 0) {
-            lcd.clear();
-            lcd.setCursor(0, 0);
-            lcd.print("Received Rs. 5");
-            delay(1500);
-
-
-            digitalWrite(RELAY_PIN, HIGH);
-            delay(2850);
-            digitalWrite(RELAY_PIN, LOW);
-
-
-            stock--;
-            EEPROM.write(EEPROM_ADDR, stock);
-
-
-            lcd.clear();
-            lcd.setCursor(0, 0);
-            lcd.print("Please Collect");
-            lcd.setCursor(0, 1);
-            lcd.print("The Napkin");
-            delay(3000);
-        } else {
-            lcd.clear();
-            lcd.setCursor(0, 0);
-            lcd.print("Please Refill");
-            delay(3000);
-        }
-
-
-        showIdleMessage();
+    // Motor 1 vending
+    if (digitalRead(VEND_BUTTON1) == LOW) {
+        vendItem(RELAY1_PIN, &stock1, EEPROM_ADDR1, "Motor 1 Vend");
     }
+
+
+    // Motor 2 vending
+    if (digitalRead(VEND_BUTTON2) == LOW) {
+        vendItem(RELAY2_PIN, &stock2, EEPROM_ADDR2, "Motor 2 Vend");
+    }
+}
+
+
+void vendItem(int relayPin, int* stock, int eepromAddr, const char* message) {
+    if (*stock > 0) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print(message);
+        delay(1500);
+
+
+        digitalWrite(relayPin, HIGH);
+        delay(2850); // Adjust motor run time
+        digitalWrite(relayPin, LOW);
+
+
+        (*stock)--;
+        EEPROM.write(eepromAddr, *stock);
+
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Please Collect");
+        lcd.setCursor(0, 1);
+        lcd.print("The Napkin");
+        delay(3000);
+    } else {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Refill ");
+        lcd.print(message);
+        delay(3000);
+    }
+
+
+    showIdleMessage();
 }
 
 
@@ -91,6 +116,8 @@ void showIdleMessage() {
     lcd.setCursor(0, 0);
     lcd.print("Lyra Enterprises");
     lcd.setCursor(0, 1);
-    lcd.print("Stock: ");
-    lcd.print(stock);
+    lcd.print("M1:");
+    lcd.print(stock1);
+    lcd.print(" M2:");
+    lcd.print(stock2);
 }
