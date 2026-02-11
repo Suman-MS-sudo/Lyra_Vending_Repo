@@ -1,0 +1,96 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+
+#define COIN_PIN 2
+#define RELAY_PIN 6
+#define RESET_PIN 4        // Button to reset stock
+#define EEPROM_ADDR 0
+#define MAX_STOCK 30
+
+
+int stock = 0;
+
+
+void setup() {
+    pinMode(COIN_PIN, INPUT);
+    pinMode(RELAY_PIN, OUTPUT);
+    pinMode(RESET_PIN, INPUT_PULLUP);  // Reset button with pull-up
+    digitalWrite(RELAY_PIN, LOW);
+
+
+    lcd.init();
+    lcd.backlight();
+
+
+    // Load saved stock
+    stock = EEPROM.read(EEPROM_ADDR);
+    if (stock > MAX_STOCK) stock = MAX_STOCK;
+
+
+    showIdleMessage();
+}
+
+
+void loop() {
+    // Reset stock if button is pressed
+    if (digitalRead(RESET_PIN) == LOW) {
+        stock = MAX_STOCK;
+        EEPROM.write(EEPROM_ADDR, stock);
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Stock Refilled");
+        delay(2000);
+        showIdleMessage();
+    }
+
+
+    // Coin detection and dispensing
+    if (digitalRead(COIN_PIN) == HIGH) {
+        if (stock > 0) {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Received Rs. 5");
+            delay(1500);
+
+
+            digitalWrite(RELAY_PIN, HIGH);
+            delay(2850);
+            digitalWrite(RELAY_PIN, LOW);
+
+
+            stock--;
+            EEPROM.write(EEPROM_ADDR, stock);
+
+
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Please Collect");
+            lcd.setCursor(0, 1);
+            lcd.print("The Napkin");
+            delay(3000);
+        } else {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Please Refill");
+            delay(3000);
+        }
+
+
+        showIdleMessage();
+    }
+}
+
+
+void showIdleMessage() {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Lyra Enterprises");
+    lcd.setCursor(0, 1);
+    lcd.print("Stock: ");
+    lcd.print(stock);
+}
