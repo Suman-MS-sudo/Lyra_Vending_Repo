@@ -2,8 +2,10 @@
 // Lyra RFID Napkin Vending Machine v4  --  ESP32
 // ================================================================
 // RFID RC522  : SS=GPIO15  RST=GPIO4
-// SD  (TFT)   : SD_CS=GPIO33  MOSI=23  MISO=19  SCK=18  VCC=3.3V
-// TFT ILI9341 : CS=GPIO2  DC=GPIO13  RST=GPIO14
+// Storage     : LittleFS (internal flash — no SD card needed)
+// LCD 1602A   : HW-61 (I2C via PCF8574 backpack)
+//               SDA=GPIO21  SCL=GPIO22  I2C addr=0x27  VCC=5V
+//               Library: "LiquidCrystal I2C" by Frank de Brabander
 // RELAY       : GPIO25
 // STOCK BTN   : GPIO27  (refill -- active LOW)
 // WIFI BTN    : GPIO32  (enable AP -- active LOW)
@@ -14,33 +16,29 @@
 //               Set time ONCE via web UI -> Settings -> Set RTC Time.
 // WiFi AP     : Lyra-Vending-AP / lyra12345  -> 192.168.4.1
 //               (ONLY active while WiFi button held / 5-min timeout)
-// Images on SD: /0.bmp=Idle /1.bmp=Card /2.bmp=Auth /3.bmp=Dispense
-//               /4.bmp=Collect /5.bmp=Deny /6.bmp=Limit /7.bmp=Empty
-//               /8.bmp=Error  /9.bmp=WiFi
+// Flash data  : /tags.txt  /vendlog.csv  /config.txt  (LittleFS)
 // ================================================================
 
 #include <SPI.h>
 #include <Wire.h>
 #include <RTClib.h>            // Adafruit RTClib — install via Library Manager
 #include <MFRC522.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ILI9341.h>
+#include <LiquidCrystal_I2C.h> // Frank de Brabander — install via Library Manager
 #include <WiFi.h>
 #include <WebServer.h>
-#include <SD.h>
+#include <LittleFS.h>
 #include "soc/soc.h"           // brownout disable
 #include "soc/rtc_cntl_reg.h"  // brownout disable
 
 // -------- Pins --------
 #define RFID_SS     15
 #define RFID_RST     4
-#define SD_CS       33
-#define TFT_CS       2
-#define TFT_DC      13
-#define TFT_RST     14
 #define RELAY_PIN   25
 #define STOCK_BTN   27
 #define WIFI_BTN    32
+
+// -------- LCD (HW-61 1602A over I2C) --------
+#define LCD_I2C_ADDR 0x27   // PCF8574 backpack default; try 0x3F if blank
 
 // -------- Tunables --------
 #define MAX_STOCK         25
@@ -50,7 +48,7 @@
 
 // -------- Objects --------
 MFRC522  rfid(RFID_SS, RFID_RST);
-Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 16, 2);
 WebServer server(80);
 
 // -------- WiFi --------
@@ -82,8 +80,6 @@ const char* F_CFG    = "/config.txt";
 
 // -------- RFID reader info --------
 uint8_t rfidVersion = 0;
-bool    sdOK        = false;
-
 // -------- Machine identity --------
 char machineName[40]     = "Lyra Vending 1";
 char machineId[20]       = "LVM-001";
@@ -105,23 +101,14 @@ int txCounter = 0;   // persisted in config.txt
 bool   waitingForScan = false;
 String scannedUID     = "";
 
-// -------- SD bus busy flag --------
-// Set true while a web handler is doing a long SD read (log/chart/report).
-// bmpDraw() respects this so RFID display skips BMP rather than fighting
-// the SPI bus mid-transfer.
-volatile bool sdBusy = false;
-
 // -------- Forward decls --------
 void showImage(uint8_t n);
-void bmpDraw(const char* fn, int16_t x, int16_t y);
-uint16_t read16(File& f);
-uint32_t read32(File& f);
 void lcdMsg(const char* l0, const char* l1 = "");
 void showIdle();
 int  findTag(const String& uid);
 void handleScan(const String& uid);
 void vend(const String& uid, int idx);
-void initSD();
+void initFS();
 void loadCfg();
 void saveCfg();
 void loadTags();
@@ -149,7 +136,6 @@ void handleSetup();
 void handleEditTag();
 void handleRecentLog();
 void handleChart7();
-void writeWebToSD();
 
 // -------- DateTime helpers --------
 // Priority: DS3231 RTC > web-set epoch offset > uptime fallback
@@ -172,10 +158,7 @@ String getTimeStr() {
 }
 
 // ================================================================
-// WEB UI — stored in flash, written to SD on first boot / /setup
-// ================================================================
-// ================================================================
-// WEB UI -- stored in flash, written to SD on first boot / /setup
+// WEB UI — served directly from PROGMEM (internal flash)
 // ================================================================
 static const char HTML_PAGE[] PROGMEM = R"rawhtml(<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lyra Vending — Control Panel</title>
 <style>
@@ -736,7 +719,7 @@ function loadHealth(){
     upt.textContent='Uptime: '+d.uptime+(d.date&&d.date!='N/A'?' \u2014 '+d.date+' '+d.time:'');
     document.getElementById('machSub').textContent=(d.machineName||'Lyra Vending')+(d.machineLocation?' \u2014 '+d.machineLocation:'');
     var rows=[
-      {k:'SD Card',v:d.sdOK?'<span class="badge on">&#10004; OK</span>':'<span class="badge off">&#10008; FAIL</span>'},
+      {k:'Flash FS',v:'<span class="badge on">&#10004; OK</span>'},
       {k:'RTC Clock',v:d.rtcOK?'<span class="badge on">&#10004; DS3231 OK</span>':'<span class="badge warn">&#9651; Not connected</span>'},
       {k:'RFID Reader',v:'<span class="badge on">Ver 0x'+d.rfidVer+'</span>'},
       {k:'WiFi AP',v:'<span class="badge on">192.168.4.1</span>'},
@@ -1008,55 +991,29 @@ setInterval(function(){
 </body>
 </html>)rawhtml";
 
-void writeWebToSD() {
-    if (!sdOK) return;
-    SD.remove("/index.html");
-    File f = SD.open("/index.html", FILE_WRITE);
-    if (!f) { Serial.println("writeWebToSD: open failed"); return; }
-    const char* p = HTML_PAGE;
-    size_t total   = strlen_P(p);
-    size_t written = 0;
-    char   buf[512];
-    while (written < total) {
-        size_t chunk = min((size_t)512, total - written);
-        memcpy_P(buf, p + written, chunk);
-        f.write((const uint8_t*)buf, chunk);
-        written += chunk;
-    }
-    f.close();
-    Serial.printf("writeWebToSD: %u bytes written\n", (unsigned)total);
-}
+
 
 // ================================================================
 // SETUP
 // ================================================================
 void setup() {
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // disable brownout to survive SD init current surge
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // disable brownout detector
     Serial.begin(115200);
     pinMode(RELAY_PIN, OUTPUT); digitalWrite(RELAY_PIN, LOW);
     pinMode(STOCK_BTN, INPUT_PULLUP);
     pinMode(WIFI_BTN,  INPUT_PULLUP);
 
-    // ── Step 1: All CS pins HIGH before touching the bus ──
-    pinMode(TFT_CS,  OUTPUT); digitalWrite(TFT_CS,  HIGH);
+    // ── Step 1: SPI CS pins HIGH ──
     pinMode(RFID_SS, OUTPUT); digitalWrite(RFID_SS, HIGH);
-    pinMode(SD_CS,   OUTPUT); digitalWrite(SD_CS,   HIGH);
-    delay(200);  // let all devices power-rail stabilise
+    delay(100);  // let power-rails stabilise
 
-    // ── Step 2: TFT init ──
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(ILI9341_BLACK);
-    digitalWrite(TFT_CS, HIGH);
-    digitalWrite(SD_CS,  HIGH);
-    delay(50);
+    // ── Step 2: LCD + RTC over I2C (independent of SPI) ──
+    Wire.begin(21, 22);  // SDA=21, SCL=22  (shared by LCD & RTC)
+    lcd.begin();
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("Lyra Vending v4");
 
-    // ── Step 3: Explicit SPI pin registration (required for SD.begin) ──
-    SPI.begin(18, 19, 23, -1);
-    delay(10);
-
-    // ── Step 3b: DS3231 RTC (I2C — independent of SPI bus) ──
-    Wire.begin(21, 22);  // SDA=21, SCL=22
     rtcOK = rtc.begin();
     if (rtcOK) {
         if (!rtc.isrunning()) {
@@ -1076,28 +1033,19 @@ void setup() {
         Serial.println("DS3231 not found — check SDA/SCL wiring");
     }
 
-    // ── Step 4: SD wake-up + init ──
-    // 16 MHz confirmed working on this board (sweep result 2026-02-22).
-    // Wake-up clocks must be sent at ≤400 kHz with CS HIGH before CMD0.
-    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
-    digitalWrite(SD_CS, HIGH);
-    for (uint8_t i = 0; i < 20; i++) SPI.transfer(0xFF);  // 160 wake-up clocks
-    SPI.endTransaction();
-    digitalWrite(SD_CS, HIGH);
+    // ── Step 3: SPI init (for RFID) ──
+    SPI.begin(18, 19, 23, -1);
     delay(10);
-    sdOK = SD.begin(SD_CS, SPI, 16000000);
-    Serial.printf("SD init: %s\n", sdOK ? "OK" : "FAILED");
 
-    // ── Step 5: Re-send TFT init (SPI.begin() above reset the peripheral) ──
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(ILI9341_BLACK);
-    tft.setTextColor(ILI9341_WHITE); tft.setTextSize(2);
-    tft.setCursor(10, 10); tft.print("Lyra Vending v4");
-    digitalWrite(SD_CS, HIGH);
-
-    if (sdOK) { initSD(); loadCfg(); loadTags(); lcdMsg("SD OK", ""); }
-    else       { lcdMsg("SD FAILED", "No card?"); delay(2000); }
+    // ── Step 4: LittleFS init (internal flash storage) ──
+    if (!LittleFS.begin(true)) {
+        Serial.println("LittleFS mount failed — formatting...");
+        LittleFS.format();
+        LittleFS.begin(false);
+    }
+    initFS(); loadCfg(); loadTags();
+    Serial.println("Storage OK (LittleFS)");
+    lcdMsg("Storage OK", "");
 
     // ── Step 6: RFID ──
     rfid.PCD_Init(); delay(100);
@@ -1153,9 +1101,7 @@ void loop() {
         }
     }
 
-    // RFID — explicitly deselect SD_CS before using SPI so its MISO
-    // doesn't interfere with the RFID chip on the shared bus
-    digitalWrite(SD_CS, HIGH);
+    // RFID — assert RFID_SS before using SPI
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
         String uid = "";
         for (byte i = 0; i < rfid.uid.size; i++) {
@@ -1181,154 +1127,39 @@ void loop() {
     }
 }
 // ================================================================
-// TFT IMAGE DISPLAY
+// LCD DISPLAY (HW-61 — 1602A 16×2 over I2C)
 // ================================================================
-uint16_t read16(File& f) {
-    uint16_t r = 0;
-    r  = (uint16_t)f.read();
-    r |= (uint16_t)f.read() << 8;
-    return r;
-}
-uint32_t read32(File& f) {
-    uint32_t r = 0;
-    r  = (uint32_t)f.read();
-    r |= (uint32_t)f.read() << 8;
-    r |= (uint32_t)f.read() << 16;
-    r |= (uint32_t)f.read() << 24;
-    return r;
-}
 
-// bmpDraw — fast path for exact-fit images (1 seek, bulk row reads, bulk TFT push).
-// Cropped images (oversized) fall back to per-row seek but still use bulk reads.
-void bmpDraw(const char* fn, int16_t sx, int16_t sy) {
-    if (!sdOK || sdBusy) return;  // don't fight SD bus during WiFi log reads
-    File f = SD.open(fn);
-    if (!f) { Serial.print("BMP missing: "); Serial.println(fn); return; }
-
-    // ── Header ──
-    if (read16(f) != 0x4D42) { f.close(); Serial.println("Not a BMP"); return; }
-    read32(f); read32(f);
-    uint32_t imgOffset = read32(f);
-    read32(f);
-    int32_t  bmpW = (int32_t)read32(f);
-    int32_t  bmpH = (int32_t)read32(f);
-    if (read16(f) != 1)              { f.close(); return; }
-    uint16_t depth    = read16(f);
-    uint32_t compress = read32(f);
-    if (depth != 24 || compress != 0) {
-        Serial.printf("BMP: unsupported depth=%d compress=%d\n", depth, compress);
-        f.close(); return;
-    }
-
-    // ── Geometry ──
-    bool flip = (bmpH > 0);
-    if (bmpH < 0) bmpH = -bmpH;
-
-    int16_t dispW = tft.width()  - sx;
-    int16_t dispH = tft.height() - sy;
-    int16_t drawW = (int16_t)min((int32_t)dispW, bmpW);
-    int16_t drawH = (int16_t)min((int32_t)dispH, bmpH);
-
-    int32_t rowSkip = (bmpH > dispH) ? (bmpH - dispH) / 2 : 0;
-    int32_t colSkip = (bmpW > dispW) ? (bmpW - dispW) / 2 : 0;
-
-    uint32_t rowBytes = ((uint32_t)bmpW * 3 + 3) & ~3UL;  // row stride, 4-byte aligned
-    uint32_t rowPad   = rowBytes - (uint32_t)bmpW * 3;
-
-    // Reusable static buffers — no heap allocation, no stack overflow
-    static uint8_t  rawBuf[320 * 3];  // one row of BGR bytes (960 B for 320-wide)
-    static uint16_t rowBuf[320];      // one row of RGB565 words
-
-    Serial.printf("BMP %s: %dx%d -> draw %dx%d, rowSkip=%d colSkip=%d\n",
-                  fn, (int)bmpW, (int)bmpH, drawW, drawH, (int)rowSkip, (int)colSkip);
-
-    // ── Fast path: image fits display exactly — ONE seek, stream forward ──
-    // Standard BMPs are stored bottom-up, so file row 0 = display row (drawH-1).
-    // Reading sequentially while rendering bottom-to-top avoids all per-row seeks.
-    bool canStream = (flip && rowSkip == 0 && colSkip == 0);
-    if (canStream) {
-        f.seek(imgOffset);
-        for (int16_t row = drawH - 1; row >= 0; row--) {
-            // Phase 1: bulk SD read — entire row in ONE call (was 960 individual reads)
-            f.read(rawBuf, (size_t)drawW * 3);
-            if (rowPad) { uint32_t p = f.position(); f.seek(p + rowPad); }
-            // BGR → RGB565
-            for (int16_t col = 0; col < drawW; col++) {
-                uint8_t b = rawBuf[col*3], g = rawBuf[col*3+1], r = rawBuf[col*3+2];
-                rowBuf[col] = tft.color565(r, g, b);
-            }
-            // Phase 2: bulk TFT push — entire row in ONE SPI burst (was 320 calls)
-            tft.startWrite();
-            tft.setAddrWindow(sx, sy + row, sx + drawW - 1, sy + row);
-            tft.writePixels(rowBuf, drawW);
-            tft.endWrite();
-        }
-    } else {
-        // Cropped path: seek per row (handles oversized images)
-        for (int16_t row = 0; row < drawH; row++) {
-            int32_t  bmpRow = flip ? (bmpH - 1 - (row + rowSkip)) : (row + rowSkip);
-            uint32_t pos    = imgOffset + (uint32_t)bmpRow * rowBytes + (uint32_t)colSkip * 3;
-            f.seek(pos);
-            f.read(rawBuf, (size_t)drawW * 3);
-            for (int16_t col = 0; col < drawW; col++) {
-                uint8_t b = rawBuf[col*3], g = rawBuf[col*3+1], r = rawBuf[col*3+2];
-                rowBuf[col] = tft.color565(r, g, b);
-            }
-            tft.startWrite();
-            tft.setAddrWindow(sx, sy + row, sx + drawW - 1, sy + row);
-            tft.writePixels(rowBuf, drawW);
-            tft.endWrite();
-        }
-    }
-    f.close();
-    digitalWrite(SD_CS, HIGH);
-}
-
-// Text fallback labels when BMP images are absent from SD
-static const char* IMG_LABEL[] = {
-    "Tap Card",    // 0 idle
-    "Card Seen",   // 1 card
-    "Authorised",  // 2 auth
-    "Dispensing",  // 3 dispense
-    "Collect!",    // 4 collect
-    "Denied",      // 5 deny
-    "Limit!",      // 6 limit
-    "Empty!",      // 7 empty
-    "Error",       // 8 error
-    "WiFi ON"      // 9 wifi
+// Per-state messages for showImage() — index matches image number 0-9
+static const char* const LCD_ROW0[] = {
+    "",               // 0 idle  (handled by showIdle)
+    "Card Detected",  // 1 card
+    "Authorized",     // 2 auth
+    "Dispensing...",  // 3 dispense
+    "Collect Napkin!",// 4 collect
+    "Unauthorized",   // 5 deny
+    "Daily Limit",    // 6 limit
+    "Out of Stock!",  // 7 empty
+    "System Error",   // 8 error
+    "WiFi Active"     // 9 wifi
 };
-static const uint16_t IMG_COLOR[] = {
-    ILI9341_DARKGREEN, ILI9341_NAVY,   ILI9341_DARKCYAN,
-    ILI9341_PURPLE,    ILI9341_OLIVE,  ILI9341_DARKGREY,
-    ILI9341_MAROON,    ILI9341_RED,    ILI9341_RED,
-    ILI9341_BLUE
+static const char* const LCD_ROW1[] = {
+    "",               // 0 idle
+    "",               // 1 card
+    "OK",             // 2 auth
+    "Please wait",    // 3 dispense
+    "",               // 4 collect
+    "Access Denied",  // 5 deny
+    "Reached!",       // 6 limit
+    "Refill needed",  // 7 empty
+    "",               // 8 error
+    "192.168.4.1"     // 9 wifi
 };
 
 void showImage(uint8_t n) {
-    char fname[10];
-    snprintf(fname, sizeof(fname), "/%d.bmp", n);
-    // Try BMP first
-    if (sdOK && SD.exists(fname)) {
-        tft.fillScreen(ILI9341_BLACK);
-        bmpDraw(fname, 0, 0);
-        return;
-    }
-    // ── No BMP: paint a coloured full-screen text card ──
-    uint8_t idx = (n < 10) ? n : 0;
-    uint16_t bg = IMG_COLOR[idx];
-    tft.fillScreen(bg);
-    tft.setTextColor(ILI9341_WHITE);
-    // Large centre label
-    tft.setTextSize(3);
-    const char* lbl = IMG_LABEL[idx];
-    int16_t tw = strlen(lbl) * 18;  // ~18px per char at size 3
-    tft.setCursor((320 - tw) / 2, 90);
-    tft.print(lbl);
-    // Machine name at top
-    tft.setTextSize(1);
-    tft.setTextColor(ILI9341_LIGHTGREY);
-    tft.setCursor(4, 6);
-    tft.print(machineName);
+    if (n == 0) { showIdle(); return; }
+    if (n >= 10) n = 8;
+    lcdMsg(LCD_ROW0[n], LCD_ROW1[n]);
 }
 
 // ================================================================
@@ -1341,7 +1172,7 @@ int findTag(const String& uid) {
 }
 
 void handleScan(const String& uid) {
-    Serial.printf("[handleScan] uid=%s sdOK=%d wifiActive=%d\n", uid.c_str(), (int)sdOK, (int)wifiActive);
+    Serial.printf("[handleScan] uid=%s wifiActive=%d\n", uid.c_str(), (int)wifiActive);
     showImage(1);
     lcdMsg("Card Detected", uid.substring(0,16).c_str());
     activeDelay(3000);
@@ -1380,7 +1211,7 @@ void handleScan(const String& uid) {
 }
 
 void vend(const String& uid, int idx) {
-    Serial.printf("[vend] stock=%d sdOK=%d\n", stock, (int)sdOK);
+    Serial.printf("[vend] stock=%d\n", stock);
     if (stock <= 0) {
         showImage(7);
         lcdMsg("Out of Stock!", "Refill needed");
@@ -1416,16 +1247,16 @@ void vend(const String& uid, int idx) {
 }
 
 // ================================================================
-// SD CARD  --  Config / Tags / Log
+// LITTLEFS  --  Config / Tags / Log
 // ================================================================
-void initSD() {
-    if (!SD.exists(F_LOG)) {
-        File f = SD.open(F_LOG, FILE_WRITE);
+void initFS() {
+    if (!LittleFS.exists(F_LOG)) {
+        File f = LittleFS.open(F_LOG, "w");
         if (f) { f.println("TxID,UID,EmpID,Name,Machine,MachineID,Location,Date,Time,UptimeSec,Uptime"); f.close(); }
     }
-    if (!SD.exists(F_TAGS)) { File f = SD.open(F_TAGS, FILE_WRITE); if (f) f.close(); }
-    if (!SD.exists(F_CFG)) {
-        File f = SD.open(F_CFG, FILE_WRITE);
+    if (!LittleFS.exists(F_TAGS)) { File f = LittleFS.open(F_TAGS, "w"); if (f) f.close(); }
+    if (!LittleFS.exists(F_CFG)) {
+        File f = LittleFS.open(F_CFG, "w");
         if (f) {
             f.printf("stock=%d\ndailylimit=%d\nmachinename=%s\nmachineid=%s\nmachilelocation=%s\nbaseepoch=0\nbasems=0\ntxcounter=0\n",
                      MAX_STOCK, dailyLimit, machineName, machineId, machineLocation);
@@ -1435,7 +1266,7 @@ void initSD() {
 }
 
 void loadCfg() {
-    File f = SD.open(F_CFG, FILE_READ); if (!f) return;
+    File f = LittleFS.open(F_CFG, "r"); if (!f) return;
     while (f.available()) {
         String line = f.readStringUntil('\n'); line.trim();
         if      (line.startsWith("stock="))          stock      = line.substring(6).toInt();
@@ -1448,59 +1279,21 @@ void loadCfg() {
         else if (line.startsWith("txcounter="))      txCounter  = line.substring(10).toInt();
     }
     f.close();
-    digitalWrite(SD_CS, HIGH);
-}
-
-// Full SD re-init before every write operation.
-// The RFID SPI transaction corrupts the SD volume's internal state even with
-// CS held HIGH — the only reliable recovery is to end and restart SD completely.
-static void sdPrep() {
-    for (uint8_t attempt = 1; attempt <= 3; attempt++) {
-        Serial.printf("[sdPrep] reinit attempt %u, freeHeap=%u\n", attempt, ESP.getFreeHeap());
-        rfid.PCD_StopCrypto1();
-        digitalWrite(RFID_SS, HIGH);
-        digitalWrite(TFT_CS,  HIGH);
-        digitalWrite(SD_CS,   HIGH);
-        delay(5);
-
-        SD.end();
-        delay(20);  // 20ms — extra settling time before SPI reinit
-        SPI.begin(18, 19, 23, -1);
-        SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
-        digitalWrite(SD_CS, HIGH);
-        for (uint8_t i = 0; i < 20; i++) SPI.transfer(0xFF);  // 160 wake-up clocks
-        SPI.endTransaction();
-        delay(10);
-        sdOK = SD.begin(SD_CS, SPI, 16000000);
-        digitalWrite(SD_CS, HIGH);
-        Serial.printf("[sdPrep] attempt %u: sdOK=%d\n", attempt, (int)sdOK);
-        if (sdOK) break;
-        delay(50U * attempt);  // backoff: 50ms, 100ms before next attempt
-    }
 }
 
 void saveCfg() {
-    Serial.println("[saveCfg] enter");
-    sdPrep();  // always reinit — lets SD recover after a transient failure
-    if (!sdOK) { Serial.println("[saveCfg] SD not OK after reinit, skipping"); return; }
-    Serial.printf("[saveCfg] SD.remove(%s) start\n", F_CFG);
-    bool removed = SD.remove(F_CFG);
-    Serial.printf("[saveCfg] SD.remove result=%d\n", (int)removed);
-    Serial.printf("[saveCfg] SD.open(%s, FILE_WRITE)\n", F_CFG);
-    File f = SD.open(F_CFG, FILE_WRITE);
-    Serial.printf("[saveCfg] file open=%d\n", (int)(bool)f);
+    LittleFS.remove(F_CFG);
+    File f = LittleFS.open(F_CFG, "w");
     if (!f) { Serial.println("[saveCfg] open failed"); return; }
-    int written = f.printf("stock=%d\ndailylimit=%d\nmachinename=%s\nmachineid=%s\nmachilelocation=%s\nbaseepoch=%lu\nbasems=%lu\ntxcounter=%d\n",
+    f.printf("stock=%d\ndailylimit=%d\nmachinename=%s\nmachineid=%s\nmachilelocation=%s\nbaseepoch=%lu\nbasems=%lu\ntxcounter=%d\n",
              stock, dailyLimit, machineName, machineId, machineLocation, baseEpoch, baseMs, txCounter);
-    Serial.printf("[saveCfg] wrote %d bytes\n", written);
     f.close();
-    digitalWrite(SD_CS, HIGH);
     Serial.println("[saveCfg] done");
 }
 
 void loadTags() {
     tagCount = 0;
-    File f = SD.open(F_TAGS, FILE_READ); if (!f) return;
+    File f = LittleFS.open(F_TAGS, "r"); if (!f) return;
     while (f.available() && tagCount < MAX_RFID_TAGS) {
         String line = f.readStringUntil('\n'); line.trim();
         if (line.length() == 0) continue;
@@ -1529,60 +1322,37 @@ void loadTags() {
         tagCount++;
     }
     f.close();
-    digitalWrite(SD_CS, HIGH);
     Serial.printf("Loaded %d tags\n", tagCount);
 }
 
 void saveTags() {
-    Serial.println("[saveTags] enter");
-    sdPrep();  // always reinit — lets SD recover after a transient failure
-    if (!sdOK) { Serial.println("[saveTags] SD not OK after reinit, skipping"); return; }
-    Serial.printf("[saveTags] SD.remove(%s) start\n", F_TAGS);
-    bool removed = SD.remove(F_TAGS);
-    Serial.printf("[saveTags] SD.remove result=%d\n", (int)removed);
-    Serial.printf("[saveTags] SD.open(%s, FILE_WRITE)\n", F_TAGS);
-    File f = SD.open(F_TAGS, FILE_WRITE);
-    Serial.printf("[saveTags] file open=%d\n", (int)(bool)f);
+    LittleFS.remove(F_TAGS);
+    File f = LittleFS.open(F_TAGS, "w");
     if (!f) { Serial.println("[saveTags] open failed"); return; }
     for (int i = 0; i < tagCount; i++) {
-        int n = f.printf("%s,%s,%s,%d,%lu,%d\n",
+        f.printf("%s,%s,%s,%d,%lu,%d\n",
                  tags[i].uid, tags[i].name, tags[i].empId,
                  tags[i].dailyCount, tags[i].lastDay, tags[i].active ? 1 : 0);
-        Serial.printf("[saveTags] tag[%d] wrote %d bytes\n", i, n);
     }
     f.close();
-    digitalWrite(SD_CS, HIGH);
     Serial.println("[saveTags] done");
 }
 
 void logTx(const String& uid, int tagIdx) {
-    Serial.println("[logTx] enter");
     txCounter++;
     saveCfg();
     const char* empId = (tagIdx >= 0) ? tags[tagIdx].empId : "N/A";
     const char* name  = (tagIdx >= 0) ? tags[tagIdx].name  : "Unknown";
-    sdPrep();
-    Serial.printf("[logTx] SD.open(%s, APPEND)\n", F_LOG);
-    File f = SD.open(F_LOG, FILE_APPEND);
-    Serial.printf("[logTx] append open=%d\n", (int)(bool)f);
-    if (!f) {
-        Serial.printf("[logTx] APPEND failed, trying FILE_WRITE\n");
-        f = SD.open(F_LOG, FILE_WRITE);
-        Serial.printf("[logTx] write open=%d\n", (int)(bool)f);
-    }
+    File f = LittleFS.open(F_LOG, "a");
+    if (!f) f = LittleFS.open(F_LOG, "w");
     if (f) {
-        int n = f.printf("%d,%s,%s,%s,%s,%s,%s,%s,%s,%lu,%s\n",
+        f.printf("%d,%s,%s,%s,%s,%s,%s,%s,%s,%lu,%s\n",
                  txCounter, uid.c_str(), empId, name,
                  machineName, machineId, machineLocation,
                  getDateStr().c_str(), getTimeStr().c_str(),
                  millis()/1000, uptime().c_str());
-        Serial.printf("[logTx] wrote %d bytes\n", n);
         f.close();
-    } else {
-        Serial.println("[logTx] log open FAILED");
     }
-    digitalWrite(SD_CS, HIGH);
-    Serial.println("[logTx] done");
 }
 
 // ================================================================
@@ -1604,65 +1374,22 @@ void activeDelay(unsigned long ms) {
     }
 }
 
-// Draw a two-line status bar at the bottom of the TFT (y=190..239)
-// Background: #fdf2f2  → RGB565 = 0xFF9E  — all text in black
+// Write two lines to the 16x2 LCD, padding each to 16 chars to clear stale chars.
 void lcdMsg(const char* l0, const char* l1) {
-    // Full-width #fdf2f2 background
-    tft.fillRect(0, 190, 320, 50, 0xFF9E);
-    tft.setTextColor(ILI9341_BLACK);
-
-    // Left: machine name (row 1) + napkins count (row 2)
-    tft.setTextSize(2);
-    tft.setCursor(4, 194); tft.print(l0);
-    tft.setCursor(4, 216); tft.print(l1);
-
-    // Right: live clock centred in right 125px panel
-    String tStr = getTimeStr();
-    int16_t tw = (int16_t)tStr.length() * 12;
-    tft.setTextSize(2);
-    tft.setCursor(195 + (125 - tw) / 2, 194);
-    tft.print(tStr);
-    // Date YYYY-MM-DD  textSize=1 (6px/char)
-    String dStr = getDateStr();
-    int16_t dw = (int16_t)dStr.length() * 6;
-    tft.setTextSize(1);
-    tft.setCursor(195 + (125 - dw) / 2, 219);
-    tft.print(dStr);
+    char row[17];
+    lcd.setCursor(0, 0);
+    snprintf(row, sizeof(row), "%-16s", l0 ? l0 : "");
+    lcd.print(row);
+    lcd.setCursor(0, 1);
+    snprintf(row, sizeof(row), "%-16s", l1 ? l1 : "");
+    lcd.print(row);
 }
 
 void showIdle() {
-    // Full-screen idle display (used when no /0.bmp on SD)
-    if (sdOK && SD.exists("/0.bmp")) {
-        // BMP idle image handles its own display; just overlay status bar
-        lcdMsg(machineName, (String("Napkins: ") + stock).c_str());
-        return;
-    }
-    tft.fillScreen(ILI9341_DARKGREEN);
-    // Header bar
-    tft.fillRect(0, 0, 320, 36, 0x0460);  // dark teal
-    tft.setTextColor(ILI9341_WHITE);
-    tft.setTextSize(2);
-    tft.setCursor(8, 10);
-    tft.print(machineName);
-    // Big prompt
-    tft.setTextSize(3);
-    tft.setTextColor(ILI9341_WHITE);
-    tft.setCursor(28, 80);
-    tft.print("Tap Your Card");
-    // Stock indicator
-    tft.setTextSize(2);
-    tft.setTextColor(ILI9341_YELLOW);
-    tft.setCursor(88, 155);
-    tft.print("Napkins: ");
-    tft.print(stock);
-    // Footer
-    tft.fillRect(0, 204, 320, 36, 0x0460);
-    tft.setTextColor(ILI9341_LIGHTGREY);
-    tft.setTextSize(1);
-    tft.setCursor(8, 216);
-    tft.print(machineLocation);
-    tft.setCursor(240, 216);
-    tft.print("Lyra v4");
+    char line0[17], line1[17];
+    snprintf(line0, sizeof(line0), "%-16s", machineName);
+    snprintf(line1, sizeof(line1), "Napkins: %-6d", stock);
+    lcdMsg(line0, line1);
 }
 
 // ================================================================
@@ -1671,24 +1398,7 @@ void showIdle() {
 void startWifi() {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(WIFI_SSID, WIFI_PASS);
-
-    // WiFi radio startup draws ~300 mA peak which can glitch the 3.3 V rail
-    // the SD card is on. Re-init SD fully after the radio settles.
     delay(300);
-    // SD.end() calls SPI.end() internally — the SPI hardware is now OFF.
-    // We must restart it with explicit pins before SD.begin() will work.
-    SD.end();
-    delay(20);
-    SPI.begin(18, 19, 23, -1);          // restart SPI peripheral with explicit pins
-    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
-    digitalWrite(SD_CS, HIGH);
-    for (uint8_t i = 0; i < 20; i++) SPI.transfer(0xFF);  // 160 wake-up clocks
-    SPI.endTransaction();
-    delay(10);
-    sdOK = SD.begin(SD_CS, SPI, 16000000);
-    digitalWrite(SD_CS, HIGH);
-    Serial.printf("SD re-init after WiFi: %s\n", sdOK ? "OK" : "FAILED");
-    if (sdOK) { loadCfg(); loadTags(); }  // reload from SD in case data changed
 
     wifiActive      = true;
     wifiStartMs     = millis();
@@ -1708,19 +1418,6 @@ void stopWifi() {
     WiFi.mode(WIFI_OFF);
     wifiActive = false;
     delay(200);
-    // Same SD re-init needed: WiFi shutdown also glitches the 3.3V rail
-    SD.end();
-    delay(20);
-    SPI.begin(18, 19, 23, -1);
-    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
-    digitalWrite(SD_CS, HIGH);
-    for (uint8_t i = 0; i < 20; i++) SPI.transfer(0xFF);
-    SPI.endTransaction();
-    delay(10);
-    sdOK = SD.begin(SD_CS, SPI, 16000000);
-    digitalWrite(SD_CS, HIGH);
-    Serial.printf("SD re-init after WiFi stop: %s\n", sdOK ? "OK" : "FAILED");
-    if (sdOK) { loadCfg(); loadTags(); }
     lcdMsg("WiFi OFF", "");
     delay(1000);
     showImage(0); showIdle();
@@ -1766,12 +1463,11 @@ void handleHealth() {
     snprintf(json, sizeof(json),
         "{\"stock\":%d,\"maxStock\":%d,\"totalTx\":%lu,"
         "\"activeTags\":%d,\"totalTags\":%d,\"dailyLimit\":%d,"
-        "\"sdOK\":%s,\"rtcOK\":%s,\"rfidVer\":\"%s\",\"uptime\":\"%s\","
+        "\"fsOK\":true,\"rtcOK\":%s,\"rfidVer\":\"%s\",\"uptime\":\"%s\","
         "\"date\":\"%s\",\"time\":\"%s\","
         "\"machineName\":\"%s\",\"machineId\":\"%s\",\"machineLocation\":\"%s\"}",
         stock, MAX_STOCK, txCounter,
         active, tagCount, dailyLimit,
-        sdOK  ? "true" : "false",
         rtcOK ? "true" : "false",
         String(rfidVersion, HEX).c_str(), uptime().c_str(),
         getDateStr().c_str(), getTimeStr().c_str(),
@@ -1913,7 +1609,6 @@ void handleSetTime() {
 
 // ---- (Re)write index.html to SD from PROGMEM ----
 void handleSetup() {
-    writeWebToSD();
     server.sendHeader("Location", "/");
     server.send(302, "text/plain", "Redirecting...");
 }
@@ -1941,10 +1636,9 @@ void handleEditTag() {
 void handleRecentLog() {
     int n = 15;
     if (server.hasArg("n")) n = constrain(server.arg("n").toInt(), 1, 50);
-    File f = SD.open(F_LOG, FILE_READ);
+    File f = LittleFS.open(F_LOG, "r");
     if (!f) { server.send(200, "application/json", "[]"); return; }
 
-    sdBusy = true;  // block bmpDraw while we hold the SD bus
     // Collect last n data lines
     const int MAXN = 50;
     String buf[MAXN];
@@ -1959,8 +1653,6 @@ void handleRecentLog() {
         yield();  // feed watchdog — log can be large
     }
     f.close();
-    digitalWrite(SD_CS, HIGH);  // release bus before building response
-    sdBusy = false;
 
     int actual = min(total, MAXN);
     // Build JSON — newest first
@@ -1995,9 +1687,8 @@ void handleChart7() {
     DS days[7] = {};
     int dc = 0;
 
-    File f = SD.open(F_LOG, FILE_READ);
+    File f = LittleFS.open(F_LOG, "r");
     if (f) {
-        sdBusy = true;
         bool hdr = true;
         while (f.available()) {
             String line = f.readStringUntil('\n'); line.trim();
@@ -2016,8 +1707,6 @@ void handleChart7() {
             yield();  // feed watchdog
         }
         f.close();
-        digitalWrite(SD_CS, HIGH);  // release bus before responding
-        sdBusy = false;
     }
 
     String json = "[";
@@ -2053,21 +1742,18 @@ void handleDownloadReport() {
     server.sendContent("# Active Tags: " + String(active) + " / " + String(tagCount) + "\r\n");
     server.sendContent("# Daily Limit Per Card: " + String(dailyLimit) + "\r\n");
     server.sendContent("# RFID Version: 0x" + String(rfidVersion, HEX) + "\r\n");
-    server.sendContent(String("# SD Card: ") + (sdOK ? "OK" : "FAIL") + "\r\n");
+    server.sendContent("# Storage: LittleFS (internal flash)\r\n");
     server.sendContent("#\r\n");
     server.sendContent("# TRANSACTION LOG\r\n");
     // Stream the full log (first line is the column header already in the file)
-    File lf = SD.open(F_LOG, FILE_READ);
+    File lf = LittleFS.open(F_LOG, "r");
     if (lf) {
-        sdBusy = true;
         while (lf.available()) {
             String line = lf.readStringUntil('\n'); line.trim();
             if (line.length() > 0) server.sendContent(line + "\r\n");
             yield();  // feed watchdog during long stream
         }
         lf.close();
-        digitalWrite(SD_CS, HIGH);
-        sdBusy = false;
     }
 
     server.sendContent("");   // terminate chunked response
