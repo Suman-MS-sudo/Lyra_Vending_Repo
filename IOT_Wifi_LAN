@@ -243,7 +243,7 @@ void saveMotorStockToEEPROM(int count, String productId = "") {
 int readMotorStockFromEEPROM() {
     EEPROM.begin(EEPROM_SIZE);
     int count = EEPROM.read(MOTOR1_ADDR);
-    if (count < 0 || count > 30) count = 30;
+    if (count < 0 || count > 25) count = 25;
     return count;
 }
 
@@ -252,8 +252,8 @@ String getCurrentFirmwareVersion() {
 }
 
 void resetAllMotorStocks() {
-    saveMotorStockToEEPROM(30, defaultProductId);
-    Serial.println("📦 All motor stocks reset to 30!");
+    saveMotorStockToEEPROM(25, defaultProductId);
+    Serial.println("📦 All motor stocks reset to 25!");
     sendMachineStatusPing();  // Sync new stock to database
 }
 
