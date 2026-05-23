@@ -1,0 +1,123 @@
+#include <MCUFRIEND_kbv.h>
+#include <SD.h>
+#include <SPI.h>
+
+MCUFRIEND_kbv tft;
+
+#define SD_CS 10  // SD card CS pin
+
+File bmpFile;
+uint16_t colorBuffer[20];
+uint8_t sdbuffer[60];  // 20 pixels * 3 bytes
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting...");
+
+  uint16_t ID = tft.readID();
+  tft.begin(ID);
+  tft.setRotation(0);  // Portrait
+  tft.fillScreen(0x0000);  // Black
+
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD initialization failed!");
+    while (1);
+  }
+  Serial.println("SD OK.");
+}
+
+void loop() {
+  if (Serial.available()) {
+    char c = Serial.read();
+    Serial.print("Command: ");
+    Serial.println(c);
+
+    if (c >= '0' && c <= '10') {
+      String filename = String(c) + ".bmp";
+      drawBMP(filename.c_str());
+    }
+  }
+}
+
+void drawBMP(const char *filename) {
+  Serial.print("Opening: ");
+  Serial.println(filename);
+
+  bmpFile = SD.open(filename);
+  if (!bmpFile) {
+    Serial.println("File not found");
+    return;
+  }
+
+  if (read16(bmpFile) != 0x4D42) {
+    Serial.println("Not a BMP file");
+    bmpFile.close();
+    return;
+  }
+
+  read32(bmpFile); // size
+  read32(bmpFile); // reserved
+  uint32_t bmpImageoffset = read32(bmpFile);
+  read32(bmpFile); // DIB header size
+  int bmpWidth = read32(bmpFile);
+  int bmpHeight = read32(bmpFile);
+
+  Serial.print("W: "); Serial.print(bmpWidth);
+  Serial.print(" H: "); Serial.println(bmpHeight);
+
+  if (bmpWidth > tft.width() || bmpHeight > tft.height()) {
+    Serial.println("Image too large for screen.");
+    bmpFile.close();
+    return;
+  }
+
+  if (read16(bmpFile) != 1 || read16(bmpFile) != 24 || read32(bmpFile) != 0) {
+    Serial.println("Unsupported BMP format");
+    bmpFile.close();
+    return;
+  }
+
+  uint32_t rowSize = (bmpWidth * 3 + 3) & ~3;
+
+  tft.setAddrWindow(0, 0, bmpWidth - 1, bmpHeight - 1);
+  bool first = true;
+
+  for (int row = bmpHeight - 1; row >= 0; row--) {
+    bmpFile.seek(bmpImageoffset + row * rowSize);
+    int col = 0;
+    while (col < bmpWidth) {
+      int batch = min(20, bmpWidth - col);
+      bmpFile.read(sdbuffer, batch * 3);
+      int idx = 0;
+      for (int i = 0; i < batch; i++) {
+        uint8_t b = sdbuffer[idx++];
+        uint8_t g = sdbuffer[idx++];
+        uint8_t r = sdbuffer[idx++];
+        colorBuffer[i] = tft.color565(r, g, b);
+      }
+      tft.pushColors(colorBuffer, batch, first);
+      first = false;
+      col += batch;
+    }
+  }
+
+  bmpFile.close();
+  Serial.println("BMP loaded.");
+}
+
+// Little-endian readers
+uint16_t read16(File &f) {
+  uint16_t result;
+  ((uint8_t *)&result)[0] = f.read();
+  ((uint8_t *)&result)[1] = f.read();
+  return result;
+}
+
+uint32_t read32(File &f) {
+  uint32_t result;
+  ((uint8_t *)&result)[0] = f.read();
+  ((uint8_t *)&result)[1] = f.read();
+  ((uint8_t *)&result)[2] = f.read();
+  ((uint8_t *)&result)[3] = f.read();
+  return result;
+}
