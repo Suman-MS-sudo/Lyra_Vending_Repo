@@ -1,0 +1,131 @@
+// ============================================================
+//  LYRA ENTERPRISES - Napkin Vending Machine (IR trigger)
+//  Board: Arduino Uno / Nano (5V logic)
+// ------------------------------------------------------------
+//  PIN CONNECTIONS
+// ------------------------------------------------------------
+//  E18-D80NK IR SENSOR
+//     Brown  (VCC)    -> 5V
+//     Blue   (GND)    -> GND
+//     Black  (SIGNAL) -> D2   (IR_SENSOR)
+//
+//  RELAY MODULE (drives vending motor)
+//     VCC             -> 5V
+//     GND             -> GND
+//     IN              -> D6   (RELAY_PIN)
+//
+//  RESET / REFILL BUTTON
+//     One leg         -> D4   (RESET_PIN)
+//     Other leg       -> GND
+//
+//  16x2 I2C LCD (address 0x27)
+//     VCC             -> 5V
+//     GND             -> GND
+//     SDA             -> A4   (Uno/Nano hardware I2C)
+//     SCL             -> A5   (Uno/Nano hardware I2C)
+// ============================================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define IR_SENSOR   2     // E18-D80NK signal (black wire), NPN NO -> LOW when hand detected
+#define RELAY_PIN   6     // Relay Module Connected to Motor
+#define RESET_PIN   4     // Button to reset stock
+#define EEPROM_ADDR 0
+#define MAX_STOCK   25
+
+int stock = 0;
+
+void setup() {
+    pinMode(IR_SENSOR, INPUT_PULLUP);   // E18-D80NK is open-collector, pull-up keeps idle HIGH
+    pinMode(RELAY_PIN, OUTPUT);
+    pinMode(RESET_PIN, INPUT_PULLUP);   // Reset button with pull-up
+    digitalWrite(RELAY_PIN, LOW);
+
+    lcd.init();
+    lcd.backlight();
+
+    // Load saved stock
+    stock = EEPROM.read(EEPROM_ADDR);
+    if (stock > MAX_STOCK) stock = MAX_STOCK;
+
+    showIdleMessage();
+}
+
+void loop() {
+    // Reset stock if button is pressed
+    if (digitalRead(RESET_PIN) == LOW) {
+        stock = MAX_STOCK;
+        EEPROM.update(EEPROM_ADDR, stock);   // update() skips the write if value is unchanged
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Stock Refilled");
+        delay(2000);
+        showIdleMessage();
+    }
+
+    // Vend when a hand is detected near the IR sensor
+    if (handDetected()) {
+        if (stock > 0) {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Napkin vending");
+            delay(1500);
+
+            digitalWrite(RELAY_PIN, HIGH);
+            delay(2850);
+            digitalWrite(RELAY_PIN, LOW);
+
+            stock--;
+            EEPROM.update(EEPROM_ADDR, stock);
+
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Please Collect");
+            lcd.setCursor(0, 1);
+            lcd.print("The Napkin");
+            delay(3000);
+        } else {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Please Refill");
+            delay(3000);
+        }
+
+        // Wait until the hand is removed so one swipe = one napkin
+        waitForHandToLeave();
+
+        showIdleMessage();
+    }
+}
+
+// Returns true only if the sensor stays LOW briefly (rejects stray IR noise)
+bool handDetected() {
+    if (digitalRead(IR_SENSOR) == LOW) {
+        delay(30);                       // short confirmation window
+        if (digitalRead(IR_SENSOR) == LOW) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Blocks until the hand moves away (with a small settle delay)
+void waitForHandToLeave() {
+    while (digitalRead(IR_SENSOR) == LOW) {
+        delay(20);
+    }
+    delay(200);   // debounce the release edge
+}
+
+void showIdleMessage() {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Lyra Enterprises");
+    lcd.setCursor(0, 1);
+    lcd.print("Stock: ");
+    lcd.print(stock);
+}
