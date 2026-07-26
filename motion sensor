@@ -23,6 +23,9 @@
 //     GND             -> GND
 //     SDA             -> A4   (Uno/Nano hardware I2C)
 //     SCL             -> A5   (Uno/Nano hardware I2C)
+// ------------------------------------------------------------
+//  Serial Monitor @ 9600 baud for debug logging.
+//  Uses lcd.begin() to match the LiquidCrystal-I2C-master fork.
 // ============================================================
 
 #include <Wire.h>
@@ -40,19 +43,25 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 int stock = 0;
 
 void setup() {
+    Serial.begin(9600);
+    Serial.println(F("\n=== Lyra Vending Machine booting ==="));
+
     pinMode(IR_SENSOR, INPUT_PULLUP);   // E18-D80NK is open-collector, pull-up keeps idle HIGH
     pinMode(RELAY_PIN, OUTPUT);
     pinMode(RESET_PIN, INPUT_PULLUP);   // Reset button with pull-up
     digitalWrite(RELAY_PIN, LOW);
 
-    lcd.init();
+    lcd.begin();
     lcd.backlight();
 
     // Load saved stock
     stock = EEPROM.read(EEPROM_ADDR);
     if (stock > MAX_STOCK) stock = MAX_STOCK;
+    Serial.print(F("Stock loaded from EEPROM: "));
+    Serial.println(stock);
 
     showIdleMessage();
+    Serial.println(F("Ready. Waiting for hand near IR sensor..."));
 }
 
 void loop() {
@@ -60,6 +69,8 @@ void loop() {
     if (digitalRead(RESET_PIN) == LOW) {
         stock = MAX_STOCK;
         EEPROM.update(EEPROM_ADDR, stock);   // update() skips the write if value is unchanged
+        Serial.print(F("[RESET] Stock refilled to "));
+        Serial.println(stock);
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("Stock Refilled");
@@ -69,7 +80,9 @@ void loop() {
 
     // Vend when a hand is detected near the IR sensor
     if (handDetected()) {
+        Serial.println(F("[IR] Hand detected"));
         if (stock > 0) {
+            Serial.println(F("[VEND] Dispensing napkin..."));
             lcd.clear();
             lcd.setCursor(0, 0);
             lcd.print("Napkin vending");
@@ -81,6 +94,8 @@ void loop() {
 
             stock--;
             EEPROM.update(EEPROM_ADDR, stock);
+            Serial.print(F("[VEND] Done. Stock remaining: "));
+            Serial.println(stock);
 
             lcd.clear();
             lcd.setCursor(0, 0);
@@ -89,6 +104,7 @@ void loop() {
             lcd.print("The Napkin");
             delay(3000);
         } else {
+            Serial.println(F("[VEND] Blocked - stock empty. Please refill."));
             lcd.clear();
             lcd.setCursor(0, 0);
             lcd.print("Please Refill");
@@ -97,6 +113,7 @@ void loop() {
 
         // Wait until the hand is removed so one swipe = one napkin
         waitForHandToLeave();
+        Serial.println(F("[IR] Hand removed. Ready."));
 
         showIdleMessage();
     }
