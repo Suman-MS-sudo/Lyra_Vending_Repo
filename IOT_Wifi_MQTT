@@ -2075,7 +2075,7 @@ void printStartupSummary(bool networkOk, const String& networkType, bool machine
 
 void setup() {
     Serial.begin(115200);
-    Serial2.begin(9600, SERIAL_8N1, 16, 17);  // UNO SoftwareSerial on pins 2/3
+    Serial2.begin(115200, SERIAL_8N1, 16, 17);  // Must match the UNO/TFT display's Serial.begin(115200) -- a baud mismatch here means the UNO misreads every command byte and never draws anything
     
     Serial.println("\n🚀 Lyra Vending Machine " + String(CURRENT_FIRMWARE_VERSION));
     Serial.println("✨ Offline Mode Enabled - Works without internet!");
